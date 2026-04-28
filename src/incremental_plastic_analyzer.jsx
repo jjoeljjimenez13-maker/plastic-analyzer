@@ -169,6 +169,9 @@ function makeP1A() {
     multiCase: false,
     indeterminacyInit: 1,
     loadArrowScale: 0.5,
+    controlDof: 10,                        // node 3 (2P, x=2.0L) y-DOF — vertical deflection at larger load
+    pushoverEnabled: true,
+    pushoverNote: 'Two-span beam · Δ measured at 2P load point',
   };
 }
 
@@ -204,6 +207,9 @@ function makeP1B() {
     multiCase: true,
     indeterminacyInit: 3,
     loadArrowScale: 5,
+    controlDof: 3,                         // node 1 (B) x-DOF — lateral at top of left column
+    pushoverEnabled: true,
+    pushoverNote: 'Asymmetric portal · Δ measured laterally at B',
   };
 }
 
@@ -340,6 +346,9 @@ function makeP3() {
     multiCase: false,
     indeterminacyInit: 27,
     loadArrowScale: 30,
+    controlDof: 36,                        // node 12 (Roof 1) x-DOF — lateral roof
+    pushoverEnabled: true,
+    pushoverNote: 'Three-story SMRF · Δ measured laterally at Roof 1',
   };
 }
 
@@ -657,7 +666,7 @@ function hingePlasticRotation(structure, snapshots, elemIdx, endIdx) {
 // (P, Δ) curve points sampled at every snapshot.
 function pushoverPoints(structure, snapshots) {
   if (structure.controlDof === undefined) return [];
-  return snapshots.map(s => ({ P: s.P, delta: s.d[structure.controlDof] }));
+  return snapshots.map(s => ({ P: s.P, delta: Math.abs(s.d[structure.controlDof]) }));
 }
 
 // Maximum |θ_p| across all hinges that have formed by snapshot k.
@@ -688,8 +697,8 @@ function findThresholdCrossing(snapshots, maxTheta, threshold, controlDof) {
       const t1 = maxTheta[k - 1], t2 = maxTheta[k];
       const frac = t2 > t1 ? (threshold - t1) / (t2 - t1) : 0;
       const Pa = snapshots[k - 1].P, Pb = snapshots[k].P;
-      const da = controlDof !== undefined ? snapshots[k - 1].d[controlDof] : 0;
-      const db = controlDof !== undefined ? snapshots[k].d[controlDof] : 0;
+      const da = controlDof !== undefined ? Math.abs(snapshots[k - 1].d[controlDof]) : 0;
+      const db = controlDof !== undefined ? Math.abs(snapshots[k].d[controlDof]) : 0;
       return { P: Pa + frac * (Pb - Pa), delta: da + frac * (db - da), k };
     }
   }
@@ -1244,9 +1253,9 @@ function PushoverPanel({ problem, analysis, currentP, P_norm, setP_norm, connect
 
   // Live (P, Δ) point from current slider position — interpolate.
   const liveDelta = (() => {
-    if (!problem.controlDof === undefined) return 0;
+    if (problem.controlDof === undefined) return 0;
     const st = interpolateState(analysis.snapshots, currentP);
-    return st.d[problem.controlDof] || 0;
+    return Math.abs(st.d[problem.controlDof] || 0);
   })();
 
   const polyline = points.map(p => `${xToPx(p.delta)},${yToPx(p.P)}`).join(' ');
@@ -1429,7 +1438,7 @@ function WalkthroughPanel({ problem, analysis, currentP }) {
           const prev = k > 0 ? snaps[k - 1] : null;
           const dP = prev ? s.P - prev.P : 0;
           const dDelta = (prev && problem.controlDof !== undefined)
-            ? s.d[problem.controlDof] - prev.d[problem.controlDof]
+            ? Math.abs(s.d[problem.controlDof]) - Math.abs(prev.d[problem.controlDof])
             : 0;
           const dRatios = dcRatios(problem, s);
           const formedHinge = (prev && s.hinges.length > prev.hinges.length)
