@@ -1,6 +1,25 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 
 // =================================================================
+// ASCE 41 NONLINEAR HINGE PARAMETERS (Tier 2/3 — pushover)
+// =================================================================
+//
+// Connection-type ductility ratios — how many multiples of yield rotation
+// the hinge can sustain before each performance level is reached.
+//   mu_LS = θ_LS / θy   (Life Safety plastic-rotation acceptance)
+//   mu_CP = θ_CP / θy   (Collapse Prevention — total rotation capacity)
+// θy itself is computed from the analysis (relative rotation at first hinge).
+// Values approximate ASCE 41-17 Table 9-7.1 modeling parameters scaled to
+// non-dimensional θy of typical W-section beams.
+const ASCE41_CONNECTIONS = {
+  'WUF-W (ductile FR)': { mu_LS: 8, mu_CP: 12, note: 'Welded unreinforced flange / bolted web — modern detailing' },
+  'RBS (reduced beam)': { mu_LS: 12, mu_CP: 18, note: 'Reduced beam section ("dogbone") — most ductile' },
+  'Pre-Northridge FR':  { mu_LS: 2.5, mu_CP: 4, note: 'Pre-1994 fully restrained — brittle weld-access-hole behavior' },
+  'Generic ductile':    { mu_LS: 6, mu_CP: 10, note: "Laursen lecture default — μ_struct ≈ 10" },
+};
+const ASCE41_DEFAULT_KEY = 'Generic ductile';
+
+// =================================================================
 // LINEAR ALGEBRA
 // =================================================================
 
@@ -243,6 +262,9 @@ function makeP2() {
     multiCase: true,
     indeterminacyInit: 6,
     loadArrowScale: 0.6,
+    controlDof: 3,                         // node 1 (LJ) lateral DOF — pushover Δ
+    pushoverEnabled: true,
+    pushoverNote: 'Two-bay portal · lateral P at LJ · Δ measured at LJ',
   };
 }
 
@@ -586,6 +608,116 @@ function interpolateState(snapshots, P) {
     return { P, d, M, hinges: last.hinges, indet: last.indet, nextHingeIdx: null, beyond: true };
   }
   return { ...last, P, beyond: true, nextHingeIdx: null };
+}
+
+
+// =================================================================
+// PUSHOVER POST-PROCESSING (Tier 1/2 — additive, no solver changes)
+// =================================================================
+
+// End rotation of element e at end (0=i, 1=j) relative to the chord, in
+// the small-rotation approximation. This is the rotation that, multiplied
+// by EI/L, gives the elastic moment at that end. After a hinge forms, the
+// relative-rotation increment IS the plastic rotation θ_p.
+function endRelRotation(structure, e, end, dispFull) {
+  const el = structure.elements[e];
+  const ni = structure.nodes[el.i], nj = structure.nodes[el.j];
+  const dx = nj.x - ni.x, dy = nj.y - ni.y;
+  const L = Math.hypot(dx, dy);
+  const c = dx / L, s = dy / L;
+  const ux_i = dispFull[3 * el.i],     uy_i = dispFull[3 * el.i + 1];
+  const ux_j = dispFull[3 * el.j],     uy_j = dispFull[3 * el.j + 1];
+  const vli = -ux_i * s + uy_i * c;    // local transverse displacement at i
+  const vlj = -ux_j * s + uy_j * c;    // local transverse displacement at j
+  const chord = (vlj - vli) / L;       // small-rotation chord rotation
+  const nodeIdx = end === 0 ? el.i : el.j;
+  const theta_global = dispFull[3 * nodeIdx + 2];
+  return theta_global - chord;
+}
+
+// For one specific hinge, return |θ_p| at every snapshot. Zero before
+// the hinge has formed; afterward it tracks the magnitude of relative
+// rotation accumulated since the moment of formation.
+function hingePlasticRotation(structure, snapshots, elemIdx, endIdx) {
+  let formedAt = -1;
+  for (let k = 1; k < snapshots.length; k++) {
+    const has = snapshots[k].hinges.some(h => h.elem === elemIdx && h.end === endIdx);
+    const had = snapshots[k - 1].hinges.some(h => h.elem === elemIdx && h.end === endIdx);
+    if (has && !had) { formedAt = k; break; }
+  }
+  if (formedAt < 0) return snapshots.map(() => 0);
+  const refRel = endRelRotation(structure, elemIdx, endIdx, snapshots[formedAt].d);
+  return snapshots.map((s, k) => {
+    if (k <= formedAt) return 0;
+    const rel = endRelRotation(structure, elemIdx, endIdx, s.d);
+    return Math.abs(rel - refRel);
+  });
+}
+
+// (P, Δ) curve points sampled at every snapshot.
+function pushoverPoints(structure, snapshots) {
+  if (structure.controlDof === undefined) return [];
+  return snapshots.map(s => ({ P: s.P, delta: s.d[structure.controlDof] }));
+}
+
+// Maximum |θ_p| across all hinges that have formed by snapshot k.
+function maxThetaPBySnapshot(structure, snapshots, hinges) {
+  const perHinge = hinges.map(h => hingePlasticRotation(structure, snapshots, h.elem, h.end));
+  return snapshots.map((_, k) => {
+    let m = 0;
+    for (const arr of perHinge) if (arr[k] > m) m = arr[k];
+    return m;
+  });
+}
+
+// Yield rotation θy = relative rotation at the first hinge's location,
+// at the snapshot where it formed. Used as the unit of ductility for
+// performance-level thresholds.
+function yieldRotation(structure, snapshots) {
+  if (snapshots.length < 2 || snapshots[1].hinges.length === 0) return 1e-6;
+  const h = snapshots[1].hinges[0];
+  const r = endRelRotation(structure, h.elem, h.end, snapshots[1].d);
+  return Math.max(Math.abs(r), 1e-6);
+}
+
+// Find P, Δ at the moment max(|θ_p|) first crosses `threshold`. Linear
+// interpolation between the two bracketing snapshots. null if never reached.
+function findThresholdCrossing(snapshots, maxTheta, threshold, controlDof) {
+  for (let k = 1; k < snapshots.length; k++) {
+    if (maxTheta[k] >= threshold) {
+      const t1 = maxTheta[k - 1], t2 = maxTheta[k];
+      const frac = t2 > t1 ? (threshold - t1) / (t2 - t1) : 0;
+      const Pa = snapshots[k - 1].P, Pb = snapshots[k].P;
+      const da = controlDof !== undefined ? snapshots[k - 1].d[controlDof] : 0;
+      const db = controlDof !== undefined ? snapshots[k].d[controlDof] : 0;
+      return { P: Pa + frac * (Pb - Pa), delta: da + frac * (db - da), k };
+    }
+  }
+  return null;
+}
+
+// D/C ratios at every potential hinge (every element end) for a given
+// snapshot. Used by the Walkthrough panel to surface "next hinge to yield".
+function dcRatios(structure, snapshot) {
+  const out = [];
+  for (let e = 0; e < structure.elements.length; e++) {
+    const el = structure.elements[e];
+    for (let end = 0; end < 2; end++) {
+      const M = snapshot.M[e][end];
+      const isHinged = snapshot.hinges.some(h => h.elem === e && h.end === end);
+      out.push({
+        elem: e, end, M, Mp: el.Mp,
+        dc: Math.abs(M) / el.Mp,
+        residual: el.Mp - Math.abs(M),
+        isHinged,
+        nodeLabel: structure.nodes[end === 0 ? el.i : el.j].label,
+        elLabel: el.label || `e${e}`,
+        elType: el.type,
+      });
+    }
+  }
+  out.sort((a, b) => b.dc - a.dc);
+  return out;
 }
 
 // =================================================================
@@ -1060,6 +1192,343 @@ function BMDView({ problem, state, scale, currentP, Pu }) {
 // MAIN APP
 // =================================================================
 
+
+// =================================================================
+// PUSHOVER CURVE PANEL (Tier 1 + Tier 2 + Tier 3)
+// =================================================================
+function PushoverPanel({ problem, analysis, currentP, P_norm, setP_norm, connection }) {
+  const points = useMemo(
+    () => pushoverPoints(problem, analysis.snapshots),
+    [problem, analysis.snapshots]
+  );
+  const maxTheta = useMemo(
+    () => maxThetaPBySnapshot(problem, analysis.snapshots, analysis.hinges),
+    [problem, analysis.snapshots, analysis.hinges]
+  );
+  const theta_y = useMemo(
+    () => yieldRotation(problem, analysis.snapshots),
+    [problem, analysis.snapshots]
+  );
+
+  const conn = ASCE41_CONNECTIONS[connection] || ASCE41_CONNECTIONS[ASCE41_DEFAULT_KEY];
+  const theta_LS = theta_y * conn.mu_LS;
+  const theta_CP = theta_y * conn.mu_CP;
+
+  // First-yield (Δy) is the displacement at snapshot 1 (first hinge formation).
+  const yieldPt = points.length > 1 ? points[1] : null;
+  // Performance crossings on the curve (in P, Δ space).
+  const cross_LS = findThresholdCrossing(analysis.snapshots, maxTheta, theta_LS, problem.controlDof);
+  const cross_CP = findThresholdCrossing(analysis.snapshots, maxTheta, theta_CP, problem.controlDof);
+
+  // Δu = where structure first crosses CP (collapse prevention failure).
+  const ult = cross_CP || (points.length > 0 ? points[points.length - 1] : null);
+  const mu_struct = yieldPt && ult && yieldPt.delta > 1e-9 ? ult.delta / yieldPt.delta : null;
+
+  // SVG geometry
+  const W = 620, H = 320;
+  const padL = 56, padR = 16, padT = 14, padB = 36;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+
+  // Determine plot extents — extend slightly past CP failure if known.
+  const lastP = points.length ? points[points.length - 1].P : 1;
+  const lastD = points.length ? points[points.length - 1].delta : 1;
+  const xMax = Math.max(
+    (ult ? ult.delta : lastD) * 1.15,
+    lastD * 1.05,
+    1e-6
+  );
+  const yMax = Math.max(lastP * 1.10, 1e-6);
+
+  const xToPx = x => padL + (x / xMax) * plotW;
+  const yToPx = y => padT + plotH - (y / yMax) * plotH;
+
+  // Live (P, Δ) point from current slider position — interpolate.
+  const liveDelta = (() => {
+    if (!problem.controlDof === undefined) return 0;
+    const st = interpolateState(analysis.snapshots, currentP);
+    return st.d[problem.controlDof] || 0;
+  })();
+
+  const polyline = points.map(p => `${xToPx(p.delta)},${yToPx(p.P)}`).join(' ');
+
+  // Performance-band x-coordinates
+  const xIO_lo = yieldPt ? xToPx(yieldPt.delta) : padL;
+  const xLS_lo = cross_LS ? xToPx(cross_LS.delta) : null;
+  const xCP_lo = cross_CP ? xToPx(cross_CP.delta) : null;
+  const xCP_hi = padL + plotW;
+
+  return (
+    <div className="border border-stone-300 bg-white rounded-sm relative">
+      <div
+        className="absolute top-1.5 left-2 text-[10px] uppercase tracking-widest text-stone-500"
+        style={{ fontFamily: 'ui-monospace, monospace' }}
+      >
+        Pushover · capacity curve
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet">
+        {/* Performance bands (under the curve) */}
+        {yieldPt && xLS_lo && (
+          <rect x={xIO_lo} y={padT} width={xLS_lo - xIO_lo} height={plotH}
+                fill="#7fb98c" fillOpacity="0.10" />
+        )}
+        {xLS_lo && xCP_lo && (
+          <rect x={xLS_lo} y={padT} width={xCP_lo - xLS_lo} height={plotH}
+                fill="#e2c14d" fillOpacity="0.13" />
+        )}
+        {xCP_lo && (
+          <rect x={xCP_lo} y={padT} width={xCP_hi - xCP_lo} height={plotH}
+                fill="#c43e3e" fillOpacity="0.10" />
+        )}
+
+        {/* Axes */}
+        <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="#666" />
+        <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="#666" />
+
+        {/* X-axis ticks */}
+        {Array.from({ length: 5 }, (_, i) => {
+          const x = (xMax * (i + 1)) / 5;
+          return (
+            <g key={`xt${i}`}>
+              <line x1={xToPx(x)} y1={padT + plotH} x2={xToPx(x)} y2={padT + plotH + 4} stroke="#666" />
+              <text x={xToPx(x)} y={padT + plotH + 16} textAnchor="middle"
+                    fontSize="10" fill="#555" fontFamily="ui-monospace, monospace">
+                {x.toFixed(x < 1 ? 3 : 2)}
+              </text>
+            </g>
+          );
+        })}
+        <text x={padL + plotW / 2} y={H - 6} textAnchor="middle" fontSize="11" fill="#333"
+              fontFamily="ui-monospace, monospace">
+          Δ (control displacement, length-units)
+        </text>
+
+        {/* Y-axis ticks */}
+        {Array.from({ length: 5 }, (_, i) => {
+          const y = (yMax * (i + 1)) / 5;
+          return (
+            <g key={`yt${i}`}>
+              <line x1={padL - 4} y1={yToPx(y)} x2={padL} y2={yToPx(y)} stroke="#666" />
+              <text x={padL - 6} y={yToPx(y) + 3} textAnchor="end"
+                    fontSize="10" fill="#555" fontFamily="ui-monospace, monospace">
+                {y.toFixed(y < 1 ? 3 : y < 10 ? 2 : 1)}
+              </text>
+            </g>
+          );
+        })}
+        <text x={14} y={padT + plotH / 2} textAnchor="middle" fontSize="11" fill="#333"
+              fontFamily="ui-monospace, monospace"
+              transform={`rotate(-90 14 ${padT + plotH / 2})`}>
+          P ({problem.units})
+        </text>
+
+        {/* Capacity curve */}
+        <polyline points={polyline} fill="none" stroke="#1a1a1a" strokeWidth="1.8" />
+
+        {/* Event markers H1, H2, ... */}
+        {points.slice(1).map((p, k) => (
+          <g key={k}>
+            <circle cx={xToPx(p.delta)} cy={yToPx(p.P)} r="3.5" fill="#fff" stroke="#1a1a1a" strokeWidth="1.4" />
+            <text x={xToPx(p.delta) + 5} y={yToPx(p.P) - 5}
+                  fontSize="9.5" fill="#1a1a1a" fontFamily="ui-monospace, monospace" fontWeight="600">
+              H{k + 1}
+            </text>
+          </g>
+        ))}
+
+        {/* Δy marker (vertical dashed) */}
+        {yieldPt && (
+          <g>
+            <line x1={xToPx(yieldPt.delta)} y1={padT} x2={xToPx(yieldPt.delta)} y2={padT + plotH}
+                  stroke="#1f7a3a" strokeWidth="1" strokeDasharray="3,3" opacity="0.6" />
+            <text x={xToPx(yieldPt.delta) + 3} y={padT + 11}
+                  fontSize="9.5" fill="#1f7a3a" fontFamily="ui-monospace, monospace" fontWeight="600">
+              Δy
+            </text>
+          </g>
+        )}
+        {/* Δu marker (CP failure) */}
+        {cross_CP && (
+          <g>
+            <line x1={xToPx(cross_CP.delta)} y1={padT} x2={xToPx(cross_CP.delta)} y2={padT + plotH}
+                  stroke="#c43e3e" strokeWidth="1.2" strokeDasharray="3,3" opacity="0.7" />
+            <text x={xToPx(cross_CP.delta) + 3} y={padT + 23}
+                  fontSize="9.5" fill="#c43e3e" fontFamily="ui-monospace, monospace" fontWeight="600">
+              Δu (CP)
+            </text>
+            <circle cx={xToPx(cross_CP.delta)} cy={yToPx(cross_CP.P)} r="4"
+                    fill="#c43e3e" stroke="#fff" strokeWidth="1.2" />
+          </g>
+        )}
+
+        {/* Live (P, Δ) marker from slider */}
+        {points.length > 0 && (
+          <g>
+            <circle cx={xToPx(liveDelta)} cy={yToPx(currentP)} r="5"
+                    fill="#1a1a1a" stroke="#fff" strokeWidth="1.5" />
+          </g>
+        )}
+      </svg>
+
+      {/* Readout strip */}
+      <div className="px-3 py-2 border-t border-stone-200 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs"
+           style={{ fontFamily: 'ui-monospace, monospace' }}>
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-stone-500">Δy</div>
+          <div className="tabular-nums font-semibold">{yieldPt ? yieldPt.delta.toExponential(2) : '—'}</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-stone-500">Δu (CP)</div>
+          <div className="tabular-nums font-semibold" style={{ color: cross_CP ? '#c43e3e' : '#666' }}>
+            {cross_CP ? cross_CP.delta.toExponential(2) : 'beyond range'}
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-stone-500">μ = Δu / Δy</div>
+          <div className="tabular-nums font-semibold">{mu_struct ? mu_struct.toFixed(2) : '—'}</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-stone-500">θy</div>
+          <div className="tabular-nums">{theta_y.toExponential(2)} rad</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =================================================================
+// HAND-PROCEDURE WALKTHROUGH PANEL (Tier 5)
+// =================================================================
+// Step-by-step narration matching Laursen's lecture: at every event,
+// show ΔP and Δδ for that step, the hinge that formed, and the D/C
+// ratios at the remaining potential hinge locations so the viewer can
+// see WHICH hinge will yield next and why.
+function WalkthroughPanel({ problem, analysis, currentP }) {
+  const snaps = analysis.snapshots;
+  const points = useMemo(() => pushoverPoints(problem, snaps), [problem, snaps]);
+
+  // Identify "current step" — the latest snapshot reached by the slider.
+  const currentStepIdx = (() => {
+    let idx = 0;
+    for (let k = 0; k < snaps.length; k++) if (snaps[k].P <= currentP + 1e-9) idx = k;
+    return idx;
+  })();
+
+  return (
+    <div className="border border-stone-300 bg-white rounded-sm relative">
+      <div
+        className="absolute top-1.5 left-2 text-[10px] uppercase tracking-widest text-stone-500"
+        style={{ fontFamily: 'ui-monospace, monospace' }}
+      >
+        Hand procedure · Laursen-style walkthrough
+      </div>
+      <div className="pt-7 pb-2 px-3 max-h-[320px] overflow-y-auto"
+           style={{ fontFamily: 'ui-monospace, monospace' }}>
+        {snaps.map((s, k) => {
+          const isCurrent = k === currentStepIdx;
+          const isReached = currentP >= s.P - 1e-9;
+          const prev = k > 0 ? snaps[k - 1] : null;
+          const dP = prev ? s.P - prev.P : 0;
+          const dDelta = (prev && problem.controlDof !== undefined)
+            ? s.d[problem.controlDof] - prev.d[problem.controlDof]
+            : 0;
+          const dRatios = dcRatios(problem, s);
+          const formedHinge = (prev && s.hinges.length > prev.hinges.length)
+            ? s.hinges[s.hinges.length - 1] : null;
+          const formedEl = formedHinge ? problem.elements[formedHinge.elem] : null;
+          const formedNode = formedHinge
+            ? problem.nodes[formedHinge.end === 0 ? formedEl.i : formedEl.j]
+            : null;
+          const nextHinge = (k < snaps.length - 1)
+            ? snaps[k + 1].hinges[snaps[k + 1].hinges.length - 1]
+            : null;
+          const nextEl = nextHinge ? problem.elements[nextHinge.elem] : null;
+          const nextNode = nextHinge
+            ? problem.nodes[nextHinge.end === 0 ? nextEl.i : nextEl.j]
+            : null;
+
+          return (
+            <div
+              key={k}
+              className="border-l-2 pl-3 mb-3 pb-1"
+              style={{
+                borderColor: isCurrent ? '#1a1a1a' : (isReached ? '#92897a' : '#d9d4ca'),
+                opacity: isReached ? 1 : 0.5,
+              }}
+            >
+              <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                <div className="text-sm">
+                  <span className="font-semibold">Step {k}</span>
+                  {k === 0 && <span className="text-stone-500 ml-2">— linear elastic, all locations intact</span>}
+                  {k > 0 && formedHinge && (
+                    <span className="text-stone-700 ml-2">
+                      hinge formed at <span className="font-semibold">{formedEl.label || `e${formedHinge.elem}`}</span>
+                      {' '}({formedEl.type}, end {formedNode.label || (formedHinge.end === 0 ? 'i' : 'j')},{' '}
+                      <span style={{ color: formedHinge.sign > 0 ? '#1f7a3a' : '#9b5d2c' }}>
+                        {formedHinge.sign > 0 ? '+Mp' : '−Mp'}
+                      </span>)
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] tabular-nums text-stone-600">
+                  {prev && <span>ΔP = <span className="font-semibold">{dP.toFixed(4)}</span> · </span>}
+                  P = <span className="font-semibold">{s.P.toFixed(4)}</span>
+                  {problem.controlDof !== undefined && (
+                    <span> · Δ = <span className="font-semibold">{points[k].delta.toExponential(2)}</span></span>
+                  )}
+                </div>
+              </div>
+
+              {/* D/C ratios — top 4 most-critical unhinged locations */}
+              {k < snaps.length - 1 && (
+                <div className="mt-1.5 text-[11px]">
+                  <div className="text-[9px] uppercase tracking-widest text-stone-500 mb-0.5">
+                    D/C ratios at this state · highest = next to yield
+                  </div>
+                  <table className="text-[11px] tabular-nums w-full">
+                    <thead className="text-stone-500">
+                      <tr>
+                        <th className="text-left font-normal pr-2">Location</th>
+                        <th className="text-right font-normal pr-2">|M| / Mp</th>
+                        <th className="text-right font-normal pr-2">|M|</th>
+                        <th className="text-right font-normal">Residual to Mp</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dRatios.filter(r => !r.isHinged).slice(0, 4).map((r, i) => {
+                        const isNext = nextHinge && r.elem === nextHinge.elem && r.end === nextHinge.end;
+                        return (
+                          <tr key={i} style={{
+                            color: isNext ? '#c43e3e' : '#444',
+                            fontWeight: isNext ? 600 : 400,
+                          }}>
+                            <td className="pr-2">
+                              {r.elLabel} ({r.elType}, {r.nodeLabel}){isNext && ' ← yields next'}
+                            </td>
+                            <td className="text-right pr-2">{r.dc.toFixed(3)}</td>
+                            <td className="text-right pr-2">{Math.abs(r.M).toFixed(3)}</td>
+                            <td className="text-right">{r.residual.toFixed(3)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {k === snaps.length - 1 && (
+                <div className="mt-1 text-[11px] text-stone-700 italic">
+                  Mechanism reached — K is singular, additional load increment cannot be carried.
+                  Pu = <span className="font-semibold">{s.P.toFixed(4)}</span> {problem.units}.
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 const TABS = ['P1A', 'P1B', 'P2', 'P3'];
 
 function App() {
@@ -1069,6 +1538,7 @@ function App() {
   const [P_norm, setP_norm] = useState(0.0);
   const [deflectScaleAdj, setDeflectScaleAdj] = useState(1.0);
   const [logExpanded, setLogExpanded] = useState(true);
+  const [connection, setConnection] = useState(ASCE41_DEFAULT_KEY);
 
   const problem = PROBLEMS[tab];
 
@@ -1171,6 +1641,23 @@ function App() {
             ))}
           </div>
           <span className="text-stone-500 text-sm">{problem.title}</span>
+
+          {problem.pushoverEnabled && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs uppercase tracking-widest text-stone-500">Connection</span>
+              <select
+                className="text-xs px-2 py-1 border border-stone-400 rounded-sm bg-white"
+                value={connection}
+                onChange={(e) => setConnection(e.target.value)}
+                style={{ fontFamily: 'ui-monospace, monospace' }}
+                title={ASCE41_CONNECTIONS[connection]?.note}
+              >
+                {Object.keys(ASCE41_CONNECTIONS).map((k) => (
+                  <option key={k} value={k}>{k}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {problem.multiCase && (
             <div className="ml-auto flex items-center gap-2">
@@ -1291,6 +1778,25 @@ function App() {
             />
           </div>
         </div>
+
+        {/* Pushover + Walkthrough — Tier 1+2+3+5, gated on problem.pushoverEnabled */}
+        {problem.pushoverEnabled && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-3">
+            <PushoverPanel
+              problem={problem}
+              analysis={analysis}
+              currentP={currentP}
+              P_norm={P_norm}
+              setP_norm={setP_norm}
+              connection={connection}
+            />
+            <WalkthroughPanel
+              problem={problem}
+              analysis={analysis}
+              currentP={currentP}
+            />
+          </div>
+        )}
 
         {/* Slider */}
         <div className="border border-stone-300 bg-white rounded-sm p-3 mb-3">
